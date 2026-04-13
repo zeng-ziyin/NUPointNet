@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from ..build import MODELS
 from ..layers import create_convblock1d, create_convblock2d, create_act, CHANNEL_MAP, \
-    create_grouper, furthest_point_sample, random_sample, three_interpolation
+    create_grouper, create_grouper_idx, furthest_point_sample, random_sample, three_interpolation
 import copy
 import math
 
@@ -94,6 +94,22 @@ def get_aggregation_feautres(p, dp, f, fj, feature_type='dp_fj'):
     return fj
 
 
+def group_by_idx(query_xyz, support_xyz, support_features, idx):
+    B, Nq, K = idx.shape
+    grouped_xyz = torch.gather(
+        support_xyz.unsqueeze(1).expand(-1, Nq, -1, -1), 2,
+        idx.unsqueeze(-1).expand(-1, -1, -1, support_xyz.shape[-1]))
+    dp = (grouped_xyz - query_xyz.unsqueeze(2)).permute(0, 3, 1, 2).contiguous()
+
+    fj = None
+    if support_features is not None:
+        grouped_f = torch.gather(
+            support_features.transpose(1, 2).unsqueeze(1).expand(-1, Nq, -1, -1), 2,
+            idx.unsqueeze(-1).expand(-1, -1, -1, support_features.shape[1]))
+        fj = grouped_f.permute(0, 3, 1, 2).contiguous()
+    return dp, fj
+
+
 class LocalAggregation(nn.Module):
     """Local aggregation layer for a set 
     Set abstraction layer abstracts features from a larger set to a smaller set
@@ -129,13 +145,15 @@ class LocalAggregation(nn.Module):
         self.pool = get_reduction_fn(self.reduction)
         self.feature_type = feature_type
 
-    def forward(self, pf, pe) -> torch.Tensor:
+    def forward(self, pf, pe, knn_idx=None):
         # p: position, f: feature
         p, f = pf
         # preconv
         f = self.convs1(f)
-        # grouping
-        dp, fj = self.grouper(p, p, f)
+        # grouping index cache
+        if knn_idx is None:
+            knn_idx = self.grouper(p, p, f)
+        dp, fj = group_by_idx(p, p, f, knn_idx)
         # pe + fj 
         f = pe + fj
         f = self.pool(f)
@@ -148,7 +166,7 @@ class LocalAggregation(nn.Module):
             logging.info(
                 f'query size: {query_xyz.shape}, support size: {support_xyz.shape}, radius: {radius}, num_neighbors: {points}')
         DEBUG end """
-        return f
+        return f, knn_idx
 
 
 class SetAbstraction(nn.Module):
@@ -240,9 +258,9 @@ class SetAbstraction(nn.Module):
                             )
             self.convs2 = nn.Sequential(*convs2)
 
-            self.grouper = create_grouper(main_group_args)
-            self.dilated_grouper = create_grouper(dilated_group_args)
-            self.np_assign = create_grouper(assign_group_args)
+            self.grouper = create_grouper_idx(main_group_args)
+            self.dilated_grouper = create_grouper_idx(dilated_group_args)
+            self.np_assign = create_grouper_idx(assign_group_args)
 
             # self.pool = lambda x: torch.max(x, dim=-1, keepdim=False)[0]
             self.pool = lambda x: torch.max(x, dim=-1, keepdim=False)[0]
@@ -256,7 +274,11 @@ class SetAbstraction(nn.Module):
                 self.sample_fn = furthest_point_sample
 
     def forward(self, pf_pe_idx):
-        p, f, pe, sorted_idx = pf_pe_idx
+        if len(pf_pe_idx) == 4:
+            p, f, pe, sorted_idx = pf_pe_idx
+        else:
+            p, f, pe = pf_pe_idx
+            sorted_idx = None
         B, N, _ = p.shape
         if self.is_head:
             f = self.convs1(f)  # (n, c)
@@ -305,7 +327,8 @@ class SetAbstraction(nn.Module):
             p = p[..., :3].contiguous()
             new_p = new_p[..., :3].contiguous()
 
-            dp_dilated, fj_dilated = self.dilated_grouper(new_p, p, f)
+            dilated_idx = self.dilated_grouper(new_p, p, f)
+            dp_dilated, fj_dilated = group_by_idx(new_p, p, f, dilated_idx)
             B, c, Nq, Kd = fj_dilated.shape
 
             dp_dilated_xyz = dp_dilated.permute(0, 2, 3, 1).contiguous().view(B * Nq, Kd, 3)
@@ -319,10 +342,11 @@ class SetAbstraction(nn.Module):
             deformed_xyz = (kernel_xyz + delta).contiguous()
 
             support_f = kernel_fj.permute(0, 2, 1).contiguous()
-            nn_dp, nn_fj = self.np_assign(deformed_xyz, kernel_xyz, support_f)
+            nn_idx = self.np_assign(deformed_xyz, kernel_xyz, support_f)
+            nn_dp, nn_fj = group_by_idx(deformed_xyz, kernel_xyz, support_f, nn_idx)
 
-            dp = nn_dp.squeeze(-1).view(B, Nq, 3, self.k).permute(0, 2, 1, 3).contiguous()
-            fj = nn_fj.squeeze(-1).view(B, Nq, c, self.k).permute(0, 2, 1, 3).contiguous()
+            dp = nn_dp.view(B, Nq, 3, self.k).permute(0, 2, 1, 3).contiguous()
+            fj = nn_fj.view(B, Nq, c, self.k).permute(0, 2, 1, 3).contiguous()
             modulation = torch.softmax(self.weight(fj), dim=-1)
             pe = self.convs2(dp)
             f = self.pool((pe + fj) * modulation)
@@ -432,13 +456,19 @@ class InvResMLP(nn.Module):
         self.act = create_act(act_args)
 
     def forward(self, pf_pe):
-        p, f, pe = pf_pe
+        if len(pf_pe) == 4:
+            p, f, pe, knn_idx = pf_pe
+        else:
+            p, f, pe = pf_pe
+            knn_idx = None
         identity = f
-        f = self.convs([p, f], pe)
+        f, knn_idx = self.convs([p, f], pe, knn_idx)
         f = self.pwconv(f)
         if f.shape[-1] == identity.shape[-1] and self.use_res:
             f += identity
         f = self.act(f)
+        if len(pf_pe) == 4:
+            return [p, f, pe, knn_idx]
         return [p, f, pe]
 
 
@@ -602,7 +632,7 @@ class NUPointNetEncoder(nn.Module):
             f0 = p0.clone().transpose(1, 2).contiguous()
         for i in range(0, len(self.encoder)):
             pe = None
-            p0, f0, pe = self.encoder[i]([p0, f0, pe])
+            p0, f0, pe, _ = self.encoder[i]([p0, f0, pe, None])
         return f0.squeeze(-1)
 
     def forward_seg_feat(self, p0, f0=None, sorted_idx=None):
@@ -620,11 +650,12 @@ class NUPointNetEncoder(nn.Module):
             else:
                 _p, _f, _ = self.encoder[i][0]([p[-1], f[-1], pe, sorted_idx])
                 if self.blocks[i] > 1:
-                    # grouping
-                    dp, _ = self.pe_grouper[i](_p, _p, None)
+                    # grouping index cache for repeated blocks in the same stage
+                    knn_idx = self.pe_grouper[i](_p, _p, None)
+                    dp, _ = group_by_idx(_p, _p, None, knn_idx)
                     # conv on neighborhood_dp
                     pe = self.pe_encoder[i](dp)
-                    _p, _f, _ = self.encoder[i][1:]([_p, _f, pe])
+                    _p, _f, _, _ = self.encoder[i][1:]([_p, _f, pe, knn_idx])
             p.append(_p)
             f.append(_f)
         return p, f
